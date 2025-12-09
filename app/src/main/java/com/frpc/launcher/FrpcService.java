@@ -172,6 +172,19 @@ public class FrpcService extends Service {
                 throw new IOException("无法复制文件到可执行目录，请确保应用有root权限: " + e.getMessage(), e);
             }
 
+            // 读取配置参数
+            String serverAddr = SettingsActivity.getServerAddr(this);
+            int serverPort = SettingsActivity.getServerPort(this);
+            String authToken = SettingsActivity.getAuthToken(this);
+            int localPort = SettingsActivity.getLocalPort(this);
+            int randomPortMin = SettingsActivity.getRandomPortMin(this);
+            int randomPortMax = SettingsActivity.getRandomPortMax(this);
+            
+            // 如果authToken为空，使用默认值
+            if (authToken == null || authToken.trim().isEmpty()) {
+                authToken = ConfigConstants.DEFAULT_AUTH_TOKEN;
+            }
+            
             // 生成随机name和port
             String randomName = generateRandomName();
             int randomPort = generateRandomPort();
@@ -179,8 +192,41 @@ public class FrpcService extends Service {
             lastInfo = "Name: " + randomName + "\nPort: " + randomPort;
             Log.d(TAG, "Generated name: " + randomName + ", port: " + randomPort);
 
-            // 修改toml文件
-            modifyTomlFile(tomlPath, randomName, randomPort);
+            // 输出配置参数到日志
+            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault());
+            String startTime = sdf.format(new java.util.Date());
+            sendOutput("========== Frpc 启动配置 ==========");
+            sendOutput("启动时间: " + startTime);
+            sendOutput("服务器地址: " + serverAddr);
+            sendOutput("服务器端口: " + serverPort);
+            sendOutput("认证令牌: " + (authToken.length() > 0 ? authToken.substring(0, Math.min(8, authToken.length())) + "..." : "未设置"));
+            sendOutput("本地端口: " + localPort);
+            sendOutput("随机端口范围: " + randomPortMin + " - " + randomPortMax);
+            sendOutput("代理名称: " + randomName);
+            sendOutput("远程端口: " + randomPort);
+            sendOutput("配置文件路径: " + tomlPath);
+            sendOutput("====================================");
+
+            // 修改toml文件，使用用户设置的配置参数
+            modifyTomlFile(tomlPath, serverAddr, serverPort, authToken, localPort, randomName, randomPort);
+            
+            // 读取并显示toml配置文件内容
+            try {
+                sendOutput("配置文件内容:");
+                @SuppressWarnings({"IOResource", "resource"})
+                FileInputStream tomlFis = new FileInputStream(tomlPath);
+                try (BufferedReader tomlReader = new BufferedReader(
+                        new InputStreamReader(tomlFis))) {
+                    String tomlLine;
+                    while ((tomlLine = tomlReader.readLine()) != null) {
+                        sendOutput("  " + tomlLine);
+                    }
+                }
+            } catch (IOException e) {
+                Log.w(TAG, "Failed to read toml file content", e);
+                sendOutput("无法读取配置文件内容: " + e.getMessage());
+            }
+            sendOutput("====================================");
 
             // 验证文件存在
             File frpcFileCheck = new File(frpcPath);
@@ -226,67 +272,104 @@ public class FrpcService extends Service {
             // 启动frpc进程（始终使用su通过root权限执行，确保权限）
             Log.d(TAG, "Starting frpc process with root: " + frpcPath + " -c " + tomlPath);
             
-            // 使用su通过root权限执行，确保有足够权限
-            Process suProcess = Runtime.getRuntime().exec("su");
-            OutputStream os = suProcess.getOutputStream();
-            
-            // 获取工作目录
-            String parentDir = frpcFileCheck.getParent();
-            if (parentDir != null) {
-                // 切换到工作目录
-                String cdCmd = "cd \"" + parentDir + "\"\n";
-                os.write(cdCmd.getBytes());
-                os.flush();
-                Log.d(TAG, "Changed working directory to: " + parentDir);
+            // 先设置执行权限（以防万一）
+            try {
+                Process chmodProcess = Runtime.getRuntime().exec(new String[]{"su", "-c", "chmod 755 \"" + frpcPath + "\""});
+                int chmodExit = chmodProcess.waitFor();
+                if (chmodExit == 0) {
+                    Log.d(TAG, "Set executable permission");
+                } else {
+                    Log.w(TAG, "Failed to set executable permission, exit code: " + chmodExit);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to set executable permission", e);
             }
             
-            // 先设置执行权限（以防万一）
-            String chmodCmd = "chmod 755 \"" + frpcPath + "\"\n";
-            os.write(chmodCmd.getBytes());
-            os.flush();
-            Log.d(TAG, "Set executable permission");
+            // 使用 su -c 执行命令，这样可以正确捕获输出
+            // 构建完整的命令，包括工作目录切换
+            String parentDir = frpcFileCheck.getParent();
+            String fullCommand;
+            if (parentDir != null) {
+                // 切换到工作目录并执行命令
+                fullCommand = "cd \"" + parentDir + "\" && \"" + frpcPath + "\" -c \"" + tomlPath + "\"";
+            } else {
+                fullCommand = "\"" + frpcPath + "\" -c \"" + tomlPath + "\"";
+            }
             
-            // 执行frpc命令（使用绝对路径，确保能找到文件）
-            // 注意：路径中包含空格，需要用引号包裹
-            String command = "\"" + frpcPath + "\" -c \"" + tomlPath + "\"\n";
-            os.write(command.getBytes());
-            os.flush();
-            Log.d(TAG, "Executed frpc command");
+            // 使用 ProcessBuilder 通过 su -c 执行，确保输出能被正确捕获
+            Log.d(TAG, "Executing command: " + fullCommand);
+            sendOutput("正在启动 frpc 进程...");
+            sendOutput("执行命令: " + fullCommand);
+            ProcessBuilder pb = new ProcessBuilder("su", "-c", fullCommand);
+            // 重定向错误流到标准输出，这样所有输出都在一个流中
+            pb.redirectErrorStream(false);
+            frpcProcess = pb.start();
+            int processId = (int) getProcessId(frpcProcess);
+            Log.d(TAG, "Started frpc process with su, PID: " + processId);
+            sendOutput("Frpc 进程已启动，PID: " + processId);
+            sendOutput("------------------------------------");
             
-            // 不要关闭流，保持su进程运行
-            // os.close(); // 注释掉，保持进程运行
-            
-            frpcProcess = suProcess;
-            Log.d(TAG, "Started frpc process with su, PID: " + getProcessId(frpcProcess));
+            // 用于收集错误信息，以便在进程退出时分析
+            final StringBuilder errorBuffer = new StringBuilder();
+            final StringBuilder outputBuffer = new StringBuilder();
             
             // 同时读取错误输出
-            new Thread(() -> {
+            Thread stderrThread = new Thread(() -> {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(frpcProcess.getErrorStream()))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        Log.e(TAG, "frpc stderr: " + line);
-                        sendOutput("[错误] " + line);
+                        // 清理 ANSI 转义码
+                        String cleanLine = removeAnsiCodes(line);
+                        Log.e(TAG, "frpc stderr: " + cleanLine);
+                        errorBuffer.append(cleanLine).append("\n");
+                        sendOutput("[错误] " + cleanLine);
                     }
                 } catch (IOException e) {
                     Log.e(TAG, "Error reading frpc stderr", e);
                 }
-            }).start();
+            });
+            stderrThread.start();
 
             // 启动读取输出的线程
-            new Thread(() -> {
+            Thread stdoutThread = new Thread(() -> {
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(frpcProcess.getInputStream()))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        Log.d(TAG, "frpc: " + line);
+                        // 清理 ANSI 转义码
+                        String cleanLine = removeAnsiCodes(line);
+                        Log.d(TAG, "frpc: " + cleanLine);
+                        outputBuffer.append(cleanLine).append("\n");
                         // 发送输出到Activity
-                        sendOutput(line);
+                        sendOutput(cleanLine);
                     }
+                    // 等待错误输出线程结束
+                    try {
+                        stderrThread.join(1000); // 最多等待1秒
+                    } catch (InterruptedException e) {
+                        Log.w(TAG, "Interrupted while waiting for stderr thread", e);
+                    }
+                    
                     // 进程退出
                     int exitCode = frpcProcess.waitFor();
                     Log.e(TAG, "Frpc process exited with code: " + exitCode);
+                    sendOutput("------------------------------------");
                     sendOutput("[进程退出，退出码: " + exitCode + "]");
+                    
+                    // 分析错误原因并提供友好提示
+                    if (exitCode != 0) {
+                        // 合并标准输出和错误输出进行分析
+                        String allOutput = outputBuffer.toString() + errorBuffer.toString();
+                        String errorSummary = analyzeError(allOutput, exitCode);
+                        if (errorSummary != null && !errorSummary.isEmpty()) {
+                            sendOutput("");
+                            sendOutput("========== 错误分析 ==========");
+                            sendOutput(errorSummary);
+                            sendOutput("==============================");
+                        }
+                    }
+                    
                     isRunning = false;
                     frpcProcess = null;
                 } catch (IOException e) {
@@ -296,7 +379,8 @@ public class FrpcService extends Service {
                     Log.e(TAG, "Interrupted while waiting for process", e);
                     sendOutput("[中断: " + e.getMessage() + "]");
                 }
-            }).start();
+            });
+            stdoutThread.start();
             
             // 等待一小段时间检查进程是否还在运行
             Thread.sleep(500);
@@ -516,6 +600,137 @@ public class FrpcService extends Service {
         return sb.toString().trim();
     }
     
+    /**
+     * 清理 ANSI 转义码（颜色代码等）
+     */
+    private String removeAnsiCodes(String text) {
+        if (text == null) {
+            return "";
+        }
+        // 移除 ANSI 转义序列，格式如 [0m, [1;33m, [1;34m 等
+        return text.replaceAll("\u001B\\[[0-9;]*[mK]", "");
+    }
+    
+    /**
+     * 分析错误信息并提供友好的提示
+     */
+    private String analyzeError(String errorText, int exitCode) {
+        if (errorText == null || errorText.isEmpty()) {
+            return "进程异常退出，退出码: " + exitCode;
+        }
+        
+        StringBuilder analysis = new StringBuilder();
+        String lowerError = errorText.toLowerCase();
+        
+        // 按优先级检查错误，只显示最相关的错误类型
+        
+        // 1. 检查连接超时错误（最高优先级）
+        if (lowerError.contains("i/o timeout") || (lowerError.contains("dial tcp") && lowerError.contains("timeout"))) {
+            analysis.append("❌ 连接服务器超时\n");
+            analysis.append("\n错误详情：\n");
+            analysis.append("无法连接到服务器，连接请求超时。\n");
+            analysis.append("\n可能的原因：\n");
+            analysis.append("1. 服务器地址或端口配置错误（当前配置: 1.2.3.4:1234）\n");
+            analysis.append("2. 网络连接问题（请检查设备网络连接）\n");
+            analysis.append("3. 服务器防火墙阻止了连接\n");
+            analysis.append("4. 服务器未运行或不可访问\n");
+            analysis.append("5. 服务器地址是内网地址，但设备不在同一网络\n");
+            analysis.append("\n排查步骤：\n");
+            analysis.append("1. 检查设置中的服务器地址和端口是否正确\n");
+            analysis.append("2. 确认设备网络连接正常（可以访问其他网站）\n");
+            analysis.append("3. 如果服务器地址是公网IP，确认服务器是否正常运行\n");
+            analysis.append("4. 如果服务器地址是内网IP，确认设备是否在同一网络\n");
+            analysis.append("5. 尝试使用其他网络环境测试（如切换到移动数据）\n");
+            analysis.append("6. 检查服务器防火墙是否允许该端口连接\n");
+            return analysis.toString(); // 连接超时是主要原因，直接返回
+        }
+        
+        // 2. 检查连接拒绝错误
+        if (lowerError.contains("connection refused") || lowerError.contains("refused")) {
+            analysis.append("❌ 连接被拒绝\n");
+            analysis.append("\n错误详情：\n");
+            analysis.append("服务器拒绝了连接请求。\n");
+            analysis.append("\n可能的原因：\n");
+            analysis.append("1. 服务器端口未开放或服务未运行\n");
+            analysis.append("2. 服务器地址配置错误\n");
+            analysis.append("3. 防火墙阻止了连接\n");
+            analysis.append("\n建议：\n");
+            analysis.append("- 确认服务器地址和端口正确\n");
+            analysis.append("- 检查服务器是否正常运行\n");
+            analysis.append("- 检查服务器防火墙设置\n");
+            return analysis.toString();
+        }
+        
+        // 3. 检查 DNS 解析错误
+        if (lowerError.contains("no such host") || (lowerError.contains("dns") && lowerError.contains("error"))) {
+            analysis.append("❌ DNS 解析失败\n");
+            analysis.append("\n错误详情：\n");
+            analysis.append("无法解析服务器地址（域名）。\n");
+            analysis.append("\n可能的原因：\n");
+            analysis.append("1. 服务器地址（域名）无法解析\n");
+            analysis.append("2. DNS 服务器配置问题\n");
+            analysis.append("3. 网络连接问题\n");
+            analysis.append("\n建议：\n");
+            analysis.append("- 检查服务器地址是否正确\n");
+            analysis.append("- 尝试使用 IP 地址代替域名\n");
+            analysis.append("- 检查设备的 DNS 设置\n");
+            return analysis.toString();
+        }
+        
+        // 4. 检查登录失败错误（只有在没有连接问题的情况下才显示）
+        if (lowerError.contains("login") && lowerError.contains("fail") && 
+            !lowerError.contains("timeout") && !lowerError.contains("refused")) {
+            analysis.append("❌ 登录服务器失败\n");
+            analysis.append("\n错误详情：\n");
+            analysis.append("已连接到服务器，但认证失败。\n");
+            analysis.append("\n可能的原因：\n");
+            analysis.append("1. 认证令牌（auth.token）配置错误\n");
+            analysis.append("2. 服务器认证配置不匹配\n");
+            analysis.append("3. 服务器拒绝认证\n");
+            analysis.append("\n建议：\n");
+            analysis.append("- 检查设置中的认证令牌是否正确\n");
+            analysis.append("- 确认服务器端的认证配置\n");
+            analysis.append("- 查看日志中的配置文件内容，确认 auth.token 设置\n");
+            return analysis.toString();
+        }
+        
+        // 5. 检查配置文件错误（更精确的匹配）
+        if ((lowerError.contains("config") && (lowerError.contains("error") || lowerError.contains("invalid"))) ||
+            (lowerError.contains("toml") && (lowerError.contains("error") || lowerError.contains("parse")))) {
+            analysis.append("❌ 配置文件错误\n");
+            analysis.append("\n错误详情：\n");
+            analysis.append("配置文件格式错误或无法读取。\n");
+            analysis.append("\n可能的原因：\n");
+            analysis.append("1. 配置文件格式错误\n");
+            analysis.append("2. 配置文件路径不正确\n");
+            analysis.append("3. 配置文件权限问题\n");
+            analysis.append("\n建议：\n");
+            analysis.append("- 检查配置文件格式是否正确\n");
+            analysis.append("- 查看日志中的配置文件内容\n");
+            analysis.append("- 确认配置文件路径正确\n");
+            return analysis.toString();
+        }
+        
+        // 如果没有匹配到特定错误，提供通用提示
+        analysis.append("❌ 进程异常退出\n");
+        analysis.append("\n退出码: ").append(exitCode).append("\n");
+        analysis.append("\n建议：\n");
+        analysis.append("- 查看上方的详细错误信息\n");
+        analysis.append("- 检查配置是否正确\n");
+        analysis.append("- 确认网络连接正常\n");
+        
+        return analysis.toString();
+    }
+    
+    /**
+     * 转义 shell 命令中的特殊字符
+     * 将命令用单引号包裹，并转义其中的单引号
+     */
+    private String escapeForShell(String command) {
+        // 将单引号转义为 '\'' (结束引号 + 转义的单引号 + 开始引号)
+        return "'" + command.replace("'", "'\\''") + "'";
+    }
+    
     private boolean isProcessAlive(Process process) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -570,7 +785,8 @@ public class FrpcService extends Service {
         return minPort + offset;
     }
 
-    private void modifyTomlFile(String tomlPath, String name, int port) throws IOException {
+    private void modifyTomlFile(String tomlPath, String serverAddr, int serverPort, String authToken, 
+                                 int localPort, String name, int remotePort) throws IOException {
         File file = new File(tomlPath);
         StringBuilder content = new StringBuilder();
         
@@ -581,11 +797,33 @@ public class FrpcService extends Service {
                 new InputStreamReader(fileInputStream))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (line.trim().startsWith("name = ")) {
+                String trimmedLine = line.trim();
+                // 更新服务器地址
+                if (trimmedLine.startsWith("serverAddr = ")) {
+                    content.append("serverAddr = \"").append(serverAddr).append("\"\n");
+                }
+                // 更新服务器端口
+                else if (trimmedLine.startsWith("serverPort = ")) {
+                    content.append("serverPort = ").append(serverPort).append("\n");
+                }
+                // 更新认证令牌
+                else if (trimmedLine.startsWith("auth.token = ")) {
+                    content.append("auth.token = \"").append(authToken).append("\"\n");
+                }
+                // 更新代理名称
+                else if (trimmedLine.startsWith("name = ")) {
                     content.append("name = \"").append(name).append("\"\n");
-                } else if (line.trim().startsWith("remotePort = ")) {
-                    content.append("remotePort = ").append(port).append("\n");
-                } else {
+                }
+                // 更新本地端口
+                else if (trimmedLine.startsWith("localPort = ")) {
+                    content.append("localPort = ").append(localPort).append("\n");
+                }
+                // 更新远程端口
+                else if (trimmedLine.startsWith("remotePort = ")) {
+                    content.append("remotePort = ").append(remotePort).append("\n");
+                }
+                // 保持其他行不变
+                else {
                     content.append(line).append("\n");
                 }
             }
@@ -594,6 +832,7 @@ public class FrpcService extends Service {
         try (FileOutputStream fos = new FileOutputStream(file)) {
             fos.write(content.toString().getBytes());
         }
+        Log.d(TAG, "Toml file modified with user settings");
     }
 
     private void stopFrpc() {
