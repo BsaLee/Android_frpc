@@ -4,7 +4,7 @@
 
 ## 📥 下载
 
-**APK下载地址**：[点击下载](https://luqiao.lanzouw.com/i3dvI3d8mmnc)
+**APK下载地址**：[点击下载](https://luqiao.lanzouw.com/izr763d8o2gh)
 
 ## 📸 应用截图
 
