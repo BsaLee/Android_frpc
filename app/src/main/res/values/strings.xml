@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Frpc启动器</string>
+    <string name="fgs_data_sync_description">此服务用于在后台运行frpc代理服务，需要持续的网络连接以保持代理功能正常运行。</string>
+</resources>
+
